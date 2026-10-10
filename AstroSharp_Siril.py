@@ -11,18 +11,28 @@ Put your weights/ folder in:
 Requires: Siril 1.4+, Python scripting enabled
 """
 
-# ── Script metadata (used by Siril's script browser) ─────────────────────────
+# ── Script metadata ───────────────────────────────────────────────────────────
 #    name:        AstroSharp
-#    description: Neural-network sharpening (Dual PSF, Hybrid, AstroClean, ...)
-#    author:      Deep Sky Detail
-#    version:     1.0
+#    description: Neural-network sharpening for astrophotography (Dual PSF,
+#                 Hybrid, AstroClean, PSF, Second Beta, First Beta, Star Mask)
+#    author:      Mark Lowry — Deep Sky Detail
+#    contact:     https://www.youtube.com/@DeepSkyDetail
+#    version:     1.1
 #    requires:    1.4.0
+#    licence:     MIT
+#
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mark Lowry
+#
+# Model weights and training code:
+#   https://github.com/deepskydetail/astrosharp-weights  (MIT licence)
+#   https://github.com/deepskydetail/astrosharp          (MIT licence)
 
 import sirilpy as s
 
 # ── Install dependencies into Siril's venv (first run only) ──────────────────
-s.ensure_installed("scipy>=1.10")
-s.ensure_installed("scikit-image>=0.21")
+s.ensure_installed("scipy", "scikit-image", "PyQt6",
+                   version_constraints=[">=1.10", ">=0.21", ">=6.0"])
 
 import sys, os, json
 from pathlib import Path
@@ -384,12 +394,11 @@ def save_config(config_path: Path, params: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GitHub weights download URL
+# GitHub weights download
 # ─────────────────────────────────────────────────────────────────────────────
-# Set this to your GitHub release URL before distributing.
-# The file should be a zip containing all .json weight files at the top level.
-# Example: https://github.com/YOUR_USER/AstroSharp/releases/latest/download/weights.zip
-WEIGHTS_GITHUB_URL = "https://github.com/YOUR_USER/AstroSharp/releases/latest/download/weights.zip"
+WEIGHTS_GITHUB_URL  = "https://github.com/deepskydetail/astrosharp-weights/raw/7e90c4ede09a6add69f1e9f8a5d2145a629067fa/weights.zip"
+WEIGHTS_ZIP_SHA256  = "c74ba65b4095f78955b37cef0f3af9c4c258375a426b76bffb7715cd6f384e6b"
+WEIGHTS_ZIP_SIZE_MB = 3.4
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model / visibility constants
@@ -550,13 +559,14 @@ class DownloadWorker(QThread):
     finished = pyqtSignal()
     error    = pyqtSignal(str)
 
-    def __init__(self, url: str, dest_dir: Path):
+    def __init__(self, url: str, dest_dir: Path, expected_sha256: str = ""):
         super().__init__()
-        self.url      = url
-        self.dest_dir = dest_dir
+        self.url             = url
+        self.dest_dir        = dest_dir
+        self.expected_sha256 = expected_sha256
 
     def run(self):
-        import urllib.request, zipfile, tempfile
+        import urllib.request, zipfile, hashlib
         try:
             self.dest_dir.mkdir(parents=True, exist_ok=True)
             tmp = self.dest_dir / "_weights_tmp.zip"
@@ -567,8 +577,17 @@ class DownloadWorker(QThread):
 
             urllib.request.urlretrieve(self.url, str(tmp), _hook)
 
+            # Verify SHA-256 before extracting
+            if self.expected_sha256:
+                sha = hashlib.sha256(tmp.read_bytes()).hexdigest()
+                if sha != self.expected_sha256.lower():
+                    tmp.unlink(missing_ok=True)
+                    self.error.emit(
+                        f"SHA-256 mismatch — download may be corrupt.\n"
+                        f"Expected: {self.expected_sha256}\nGot:      {sha}")
+                    return
+
             with zipfile.ZipFile(tmp, "r") as z:
-                # Extract only .json files, stripping any subfolder
                 for member in z.namelist():
                     if member.endswith(".json"):
                         data = z.read(member)
@@ -579,10 +598,7 @@ class DownloadWorker(QThread):
             self.progress.emit(100)
             self.finished.emit()
         except Exception as e:
-            try:
-                (self.dest_dir / "_weights_tmp.zip").unlink(missing_ok=True)
-            except Exception:
-                pass
+            (self.dest_dir / "_weights_tmp.zip").unlink(missing_ok=True)
             self.error.emit(str(e))
 
 
@@ -741,59 +757,44 @@ class AstroSharpDialog(QDialog):
         root.addLayout(btn_row2)
 
     def _psf_row(self, grid, row, label, default, key):
-        """Combobox row with optional Auto button."""
+        container = QWidget()
+        hl = QHBoxLayout(container)
+        hl.setContentsMargins(0, 0, 0, 0)
         lbl = QLabel(label)
         lbl.setFixedWidth(160)
-        cb  = QComboBox()
+        cb = QComboBox()
         cb.setFont(QFont("Helvetica", 12))
-
-        widgets = [lbl, cb]
-        grid.addWidget(lbl, row, 0)
-        grid.addWidget(cb,  row, 1)
-
+        hl.addWidget(lbl)
+        hl.addWidget(cb)
         if self.get_psf is not None:
             btn = QPushButton("★ Auto")
             btn.setFixedWidth(80)
             btn.clicked.connect(lambda _=False, k=key: self._auto_psf(k))
-            grid.addWidget(btn, row, 2)
-            widgets.append(btn)
-
-        # Row container for show/hide
-        container = QWidget()
-        hl = QHBoxLayout(container)
-        hl.setContentsMargins(0, 0, 0, 0)
-        for w in widgets:
-            hl.addWidget(w)
-
+            hl.addWidget(btn)
+        grid.addWidget(container, row, 0, 1, 3)
         return container, cb, None
 
     def _slider_row(self, grid, row, label, mn, mx, default, col_span, scale):
-        """Label + QSlider + value label. scale = value per unit."""
+        container = QWidget()
+        hl = QHBoxLayout(container)
+        hl.setContentsMargins(0, 0, 0, 0)
         lbl = QLabel(label)
         lbl.setFixedWidth(160)
-        sl  = QSlider(Qt.Orientation.Horizontal)
+        sl = QSlider(Qt.Orientation.Horizontal)
         sl.setMinimum(mn)
         sl.setMaximum(mx)
         sl.setValue(default)
-        val = QLabel(str(round(default * scale, 2) if scale != 1 else default))
+        val = QLabel(str(int(default)) if scale == 1 else str(round(default * scale, 2)))
         val.setObjectName("val_lbl")
         val.setFixedWidth(48)
         val.setAlignment(Qt.AlignmentFlag.AlignRight)
         sl.valueChanged.connect(
             lambda v, lv=val, sc=scale: lv.setText(
                 str(int(v)) if sc == 1 else str(round(v * sc, 2))))
-
-        grid.addWidget(lbl, row, 0)
-        grid.addWidget(sl,  row, 1)
-        grid.addWidget(val, row, 2)
-
-        container = QWidget()
-        hl = QHBoxLayout(container)
-        hl.setContentsMargins(0, 0, 0, 0)
         hl.addWidget(lbl)
         hl.addWidget(sl)
         hl.addWidget(val)
-
+        grid.addWidget(container, row, 0, 1, 3)
         return container, sl, val
 
     # ── Logic ─────────────────────────────────────────────────────────────────
@@ -858,14 +859,15 @@ class AstroSharpDialog(QDialog):
 
     def _browse_and_install(self):
         src = QFileDialog.getExistingDirectory(
-            self, "Select weights/ folder containing .json files")
+            self, "Select folder containing .json weight files")
         if not src:
             return
         src_path = Path(src)
         if not any(src_path.glob("*.json")):
             QMessageBox.critical(self, "AstroSharp",
                 f"No .json weight files found in:\n{src}\n\n"
-                "Run export_weights.R first.")
+                "Use the AstroSharp export_weights.R script to generate them,\n"
+                "or use Download from GitHub to fetch them automatically.")
             return
         n = install_weights(src_path, self.default_weights)
         self._refresh_weights_status()
@@ -873,10 +875,13 @@ class AstroSharpDialog(QDialog):
         self._set_status(f"Installed {n} weight files ✓", "#4ade80")
 
     def _download_from_github(self):
-        if WEIGHTS_GITHUB_URL.startswith("https://github.com/YOUR_USER"):
-            QMessageBox.warning(self, "AstroSharp",
-                "GitHub URL not configured.\n\n"
-                "Edit WEIGHTS_GITHUB_URL at the top of the script.")
+        reply = QMessageBox.question(
+            self, "AstroSharp — Download Weights",
+            f"This will download approximately {WEIGHTS_ZIP_SIZE_MB} MB of model "
+            f"weight files from GitHub and install them to:\n\n{self.default_weights}\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         self._dl_bar.setVisible(True)
@@ -885,7 +890,8 @@ class AstroSharpDialog(QDialog):
         self._btn_close.setEnabled(False)
         self._set_status("Downloading weights…", "#f6ad55")
 
-        self._dl_worker = DownloadWorker(WEIGHTS_GITHUB_URL, self.default_weights)
+        self._dl_worker = DownloadWorker(WEIGHTS_GITHUB_URL, self.default_weights,
+                                         WEIGHTS_ZIP_SHA256)
         self._dl_worker.progress.connect(self._dl_bar.setValue)
         self._dl_worker.finished.connect(self._on_download_done)
         self._dl_worker.error.connect(self._on_download_error)
@@ -954,6 +960,20 @@ class AstroSharpDialog(QDialog):
         self._status_lbl.setStyleSheet(
             f"color: {colour}; font-family: Courier; font-size: 13px;")
 
+    def _is_busy(self):
+        return ((self._worker is not None and self._worker.isRunning()) or
+                (self._dl_worker is not None and self._dl_worker.isRunning()))
+
+    def closeEvent(self, event):
+        if self._is_busy():
+            event.ignore()
+        else:
+            event.accept()
+
+    def reject(self):
+        if not self._is_busy():
+            super().reject()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
@@ -1000,18 +1020,20 @@ def main():
         channels   = pixel_data.shape[2] if pixel_data.ndim == 3 else 1
         color_mode = "Color" if channels >= 3 else "Black and White"
 
+        scale_factor = 1.0
         if pixel_data.dtype == np.uint16:
             arr        = pixel_data.astype(np.float32) / 65535.0
             was_uint16 = True
         else:
             arr = pixel_data.astype(np.float32)
             if arr.max() > 1.5:
-                arr = arr / arr.max()
+                scale_factor = float(arr.max())
+                arr = arr / scale_factor
             was_uint16 = False
 
         sel = siril.get_siril_selection() if params.get("use_roi") else None
         if sel is not None:
-            roi_x, roi_y, roi_h, roi_w = sel
+            roi_x, roi_y, roi_w, roi_h = sel
             if roi_w > 0 and roi_h > 0:
                 roi_y_np = arr.shape[0] - roi_y - roi_h
                 siril.log(f"  ROI: x={roi_x} y={roi_y} w={roi_w} h={roi_h}")
@@ -1052,6 +1074,10 @@ def main():
         if out.ndim == 3:
             out = np.transpose(out, (2, 0, 1))
 
+        # Restore original scale for float images that were rescaled
+        if not was_uint16 and scale_factor != 1.0:
+            out = out * scale_factor
+
         siril.undo_save_state("AstroSharp")
         with siril.image_lock():
             siril.set_image_pixeldata(out)
@@ -1082,4 +1108,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()tr
+    main()
